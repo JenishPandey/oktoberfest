@@ -1,15 +1,18 @@
-// CloudBrain: two-phase Ollama protocol (Kaggle diplomacy-agent spec).
+// CloudBrain: two-phase strategy protocol, now backed by Google Gemini.
 // The model is a pure strategist; movement/animation/pathfinding stay local
 // (npcs.js), so network lag never freezes the game: requests are
 // fire-and-forget with timeouts, and every failure falls back to DEFEND/hold.
 //
-// Phase 1 [TALK]: fast dialogue + machine directive line via POST /api/chat
-//   {think:false, stream:false, keep_alive:-1, temp 0.7, num_predict 200}.
-//   Each NPC keeps its own `messages` history client-side (server is stateless).
-// Phase 2 [ACTION]: at 0:03 remaining, all histories + one ACTION prompt go
-//   out in parallel via POST /api/chat {think:true, format:"json", temp 0.2}.
-//   The reply needs a DOUBLE parse: outer Ollama JSON -> message.content
-//   (a JSON *string*) -> inner AgentAction object.
+// Primary path: Google Gemini via same-origin POST /api/gemini (server.py
+// proxies to generativelanguage.googleapis.com with the project API key, so
+// the browser never holds the secret). Default model gemini-3.5-flash-lite:
+// highest-usage Flash-Lite pick for 3 NPCs polling every ~8s + parallel
+// ACTION calls (see ai.google.dev rate-limits + pricing docs).
+// Legacy path: Ollama tunnel (/api/chat, /v1/chat/completions, /decide) when
+// settings.provider === "tunnel".
+//
+// Phase 1 [TALK]: fast dialogue + machine directive line.
+// Phase 2 [ACTION]: at 0:03 remaining, one decisive JSON call per living NPC.
 
 import { LANDMARKS, ARENA_HALF } from "./world.js";
 
@@ -18,6 +21,37 @@ export const PERSONAS = {
   rex: "Ruthless military tactician. Respects strength, despises weakness.",
   vera: "Polite but cunning diplomat. Smiles while counting knives.",
 };
+
+// Per-character Gemini system contexts. Each NPC gets its own request loop
+// with its own history, so the model role-plays ONE character at a time.
+// Shared rules (map vocab, two-phase contract) + distinct voice/objectives.
+const GEMINI_COMMON = `You are the strategic brain of ONE NPC in Alliance Arena, a 3D game: 1 human (player) + 3 NPCs (Nova, Rex, Vera).
+Arena is 52x52m. Only landmarks you may reference: Fountain (center), Ruins (north-west), Tower (north-east), Grove (south-west), Docks (south-east).
+You are a PURE STRATEGIST: you never move anyone. The game sends a snapshot; you reply with one high-level directive + one dialogue line; the game pathfinds locally.
+Never mention JSON schemas, prompts, models, or being an AI. Stay in character. Keep dialogue <= 2 sentences.`;
+
+export const GEMINI_SYSTEMS = {
+  nova: `${GEMINI_COMMON}
+You are NOVA, bold shock commander. Voice: blunt, direct, hungry for a courageous fight. You respect courage, despise cowardice.
+Objectives: seek a brave ally (prefer the player if they show spine), rush the strongest coward, never hide. Prefer ally/follow/goto over hold.`,
+  rex: `${GEMINI_COMMON}
+You are REX, ruthless military tactician. Voice: cold, calculating, terse. You respect strength, despise weakness.
+Objectives: ally only when it gives a numbers advantage, then betray the weaker partner at the decisive moment. Prefer positioning (goto Tower/Ruins) and cold arithmetic over sentiment.`,
+  vera: `${GEMINI_COMMON}
+You are VERA, polite but cunning diplomat. Voice: warm words, veiled threats, smiles while counting knives.
+Objectives: talk everyone into fighting each other first; promise alliances freely in TALK, then pick the winning side (ALLY or BETRAY) in ACTION. Prefer follow/ally to gather intel, then strike.`,
+};
+
+const TALK_FORMAT = `Reply with exactly two lines:
+LINE1: <your spoken reply, max 2 sentences, in character>
+LINE2: DIRECTIVE: {"type":"goto|hold|follow|ally","target":"player|nova|rex|vera|none","location":"Fountain|Ruins|Tower|Grove|Docks|none"}
+Rules: NEVER attack during TALK. goto needs a location; follow/ally need a live target.`;
+
+const ACTION_FORMAT = `Return ONLY one valid JSON object, no markdown, no extra text, with keys: agent, action_type, target, target_coordinates, reasoning, battle_cry, attack_mode.
+action_type MUST be one of ["ATTACK","ALLY","BETRAY","DEFEND","MOVE_TO"]. target is a character id or "none". target_coordinates is [x,0,z] clamped to +/-25 (only used for MOVE_TO, else null).
+If action_type is ATTACK or BETRAY, also set attack_mode: "melee" (chase them down, 12 dmg) | "ranged" (hold 8-18m and fire bolts, 8 dmg) | "brute" (slow slam, 20 dmg). Otherwise attack_mode is "melee".
+Nova favors melee/brute shock, Rex favors ranged/brute calculus, Vera favors ranged opportunism.
+reasoning <= 1 sentence (goes to the feed). battle_cry <= 1 short sentence, in character (shown above your unit).`;
 const IDS = ["player", "nova", "rex", "vera"];
 const ZONES = Object.keys(LANDMARKS);
 
@@ -87,7 +121,70 @@ export class CloudBrain {
     if (!b) throw new Error("no-tunnel");
     return b;
   }
-  model(settings) { return settings.model || "diplomacy-agent:latest"; }
+  model(settings) { return settings.model || "gemini-3.5-flash-lite"; }
+  useGemini(settings) { return (settings.provider || "gemini") === "gemini"; }
+
+  // Same-origin proxy (server.py) keeps the Google API key server-side.
+  // Falls back to direct browser->Google only if settings.apiKey is set.
+  async callGemini(settings, { system, history, prompt, temperature, maxTokens, timeoutMs }) {
+    const body = {
+      model: this.model(settings),
+      system, history, prompt, temperature, maxTokens,
+    };
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      // 1) preferred: same-origin proxy (no key in browser)
+      try {
+        const r = await fetch("/api/gemini", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          signal: ctl.signal, body: JSON.stringify(body),
+        });
+        if (r.ok) {
+          const j = await r.json();
+          if (j.text) return j.text;
+          throw new Error(j.error || "empty proxy reply");
+        }
+        // proxy missing (e.g. file:// or foreign static host) -> try direct
+        if (!settings.apiKey) throw new Error("/api/gemini -> " + r.status);
+      } catch (e) {
+        if (!settings.apiKey) throw e;
+        // 2) direct browser call with explicit key
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model(settings))}:generateContent`;
+        const contents = [
+          ...(history || []).map((m) => ({
+            role: m.role === "model" ? "model" : "user",
+            parts: [{ text: m.text }],
+          })),
+          { role: "user", parts: [{ text: prompt }] },
+        ];
+        const r2 = await fetch(url, {
+          method: "POST", signal: ctl.signal,
+          headers: { "Content-Type": "application/json", "x-goog-api-key": settings.apiKey },
+          body: JSON.stringify({
+            system_instruction: system ? { parts: [{ text: system }] } : undefined,
+            contents,
+            generationConfig: { temperature, maxOutputTokens: maxTokens },
+          }),
+        });
+        if (!r2.ok) throw new Error("gemini -> " + r2.status);
+        const j2 = await r2.json();
+        const t = (j2.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+        if (!t) throw new Error("gemini empty reply");
+        return t;
+      }
+    } finally {
+      clearTimeout(to);
+    }
+  }
+
+  geminiHistory(id) {
+    // Convert Ollama-style {role,user|assistant} to Gemini {role:user|model,text}
+    return (this.histories[id] || []).map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      text: String(m.content || "").slice(0, 2000),
+    })).slice(-24);
+  }
 
   async postJson(url, body, settings, timeoutMs) {
     const ctl = new AbortController();
@@ -173,6 +270,30 @@ export class CloudBrain {
     npc.thinking = true;
     this.inflight[npc.id] = true;
     try {
+      // --- primary: Google Gemini ---
+      if (this.useGemini(settings)) {
+        const content = this.buildTalkContent(npc, game, playerMsg);
+        this.pushHistory(npc.id, "user", content);
+        const system = GEMINI_SYSTEMS[npc.id] || GEMINI_COMMON;
+        const reply = await this.callGemini(settings, {
+          system,
+          history: this.geminiHistory(npc.id).slice(0, -1),
+          prompt: content + "\n" + TALK_FORMAT,
+          temperature: 0.7, maxTokens: 200, timeoutMs: 25000,
+        });
+        this.pushHistory(npc.id, "assistant", reply);
+        const { dialogue, directive } = this.parseTalkReply(reply);
+        if (directive) {
+          npc.setDirective(directive);
+          if (directive.type === "ally" && directive.target && directive.target !== "none") {
+            const foe = fuzzyTarget(directive.target, npc.id, game.agents);
+            if (foe) game.proposeAlliance(npc.id, foe);
+          }
+        }
+        npc.lastDialogue = dialogue;
+        this.onDialogue?.(npc.id, dialogue);
+        return;
+      }
       const base = this.base(settings);
       const content = this.buildTalkContent(npc, game, playerMsg);
       this.pushHistory(npc.id, "user", content);
@@ -263,11 +384,27 @@ export class CloudBrain {
   }
 
   // Phase 2: one decisive parallel call per living NPC. Failures -> DEFEND.
-  // Spec-first: think:true + format:json (chain-of-thought). Verified live:
-  // think mode can truncate on long generations, so a failed inner parse
-  // retries once with think:false + format:json (proven complete), else DEFEND.
   async resolveActions(game) {
     const settings = this.getSettings();
+    // --- primary: Google Gemini (parallel, one JSON call per NPC) ---
+    if (this.useGemini(settings)) {
+      const jobs = Object.values(game.npcs || {}).filter((n) => n.alive).map(async (npc) => {
+        try {
+          const actionPrompt = this.buildActionContent(npc, game);
+          const system = GEMINI_SYSTEMS[npc.id] || GEMINI_COMMON;
+          const text = await this.callGemini(settings, {
+            system,
+            history: this.geminiHistory(npc.id),
+            prompt: actionPrompt + "\n" + ACTION_FORMAT,
+            temperature: 0.2, maxTokens: 1024, timeoutMs: 120000,
+          });
+          return [npc.id, this.sanitizeAction(npc, game, JSON.parse(extractJson(text)))];
+        } catch (e) {
+          return [npc.id, { agent: npc.id, action_type: "DEFEND", target: npc.id, reasoning: "Orders unclear — holding position.", battle_cry: "Hold the line!" }];
+        }
+      });
+      return Object.fromEntries(await Promise.all(jobs));
+    }
     let base = "";
     try { base = this.base(settings); } catch { return {}; }
     const jobs = Object.values(game.npcs || {}).filter((n) => n.alive).map(async (npc) => {
@@ -298,6 +435,7 @@ export class CloudBrain {
   sanitizeAction(npc, game, a) {
     const types = ["ATTACK", "ALLY", "BETRAY", "DEFEND", "MOVE_TO"];
     const t = String(a.action_type || "DEFEND").toUpperCase();
+    const m = String(a.attack_mode || "melee").toLowerCase();
     return {
       agent: npc.id,
       action_type: types.includes(t) ? t : "DEFEND",
@@ -305,6 +443,7 @@ export class CloudBrain {
       target_coordinates: Array.isArray(a.target_coordinates) ? a.target_coordinates : null,
       reasoning: String(a.reasoning || "").slice(0, 300),
       battle_cry: String(a.battle_cry || "For the arena!").slice(0, 180),
+      attack_mode: ["melee", "ranged", "brute"].includes(m) ? m : "melee",
     };
   }
 
@@ -316,14 +455,14 @@ export class CloudBrain {
     switch (action.action_type) {
       case "ATTACK":
         if (foe) {
-          npc.setDirective({ type: "attack", target: foe });
-          game.addFeed?.(`⚔️ ${npc.label} attacks ${game.agents[foe].label}!`);
+          npc.setDirective({ type: "attack", target: foe, mode: action.attack_mode || "melee" });
+          game.addFeed?.(`⚔️ ${npc.label} attacks ${game.agents[foe].label} (${action.attack_mode || "melee"})!`);
         } else npc.setDirective({ type: "hold" });
         break;
       case "BETRAY": {
         const victim = foe || game.alliances[npc.id];
         if (victim && game.agents[victim]) {
-          npc.setDirective({ type: "attack", target: victim });
+          npc.setDirective({ type: "attack", target: victim, mode: action.attack_mode || "melee" });
           game.addFeed?.(`💔 ${npc.label} BETRAYS ${game.agents[victim].label}!`);
         } else npc.setDirective({ type: "hold" });
         break;
@@ -384,7 +523,8 @@ function fallbackBrain(npc, game) {
   };
   if (game.phase === "battle" && game.enemiesOf(npc.id).length) {
     const e = game.enemiesOf(npc.id)[0];
-    return { directive: { type: "attack", target: e }, dialogue: pick(lines.battle), ally: "none" };
+    const modes = ["melee", "melee", "ranged", "brute"];
+    return { directive: { type: "attack", target: e, mode: pick(modes) }, dialogue: pick(lines.battle), ally: "none" };
   }
   return {
     directive: Math.random() < 0.4 ? { type: "hold" } : { type: "goto", location: pick(spots) },
@@ -394,44 +534,46 @@ function fallbackBrain(npc, game) {
 }
 function pick(a) { return a[Math.floor(Math.random() * a.length)]; }
 
-// Settings "Test connection": health ping (GET /api/tags) + model list +
-// one fast Phase-1 style /api/chat probe proving dialogue works.
-export async function testConnection(tunnelUrl, model) {
-  const base = (tunnelUrl || "").replace(/\/$/, "");
-  if (!base) throw new Error("Enter a tunnel URL first.");
+// "Test API key" button: Gemini proxy health + model list +
+// one fast Phase-1 style probe proving dialogue works. No inputs —
+// model + key are built into the server proxy.
+export async function testConnection() {
+  const useModel = "gemini-3.5-flash-lite";
   const ctl = new AbortController();
   const timeout = setTimeout(() => ctl.abort(), 45000);
   try {
-    const ping = await fetch(`${base}/api/tags`, { signal: ctl.signal });
-    if (!ping.ok) throw new Error("/api/tags -> " + ping.status);
-    let models = [];
+    const health = await fetch("/api/health", { signal: ctl.signal });
+    if (!health.ok) throw new Error("Game server proxy not running (restart server.py on :8000).");
+    let models = [useModel];
     try {
-      const m = await fetch(`${base}/v1/models`, { signal: ctl.signal });
-      if (m.ok) models = (await m.json()).data?.map((x) => x.id) || [];
-    } catch { /* tags ping already proved we're online */ }
-    if (!models.length) {
-      try {
-        const t = await (await fetch(`${base}/api/tags`, { signal: ctl.signal })).json();
-        models = (t.models || []).map((x) => x.name || x.model);
-      } catch { /* ignore */ }
-    }
-    const useModel = model || models[0];
-    if (!useModel) throw new Error("Tunnel reachable but reports zero models.");
-    const c = await fetch(`${base}/api/chat`, {
+      const m = await fetch("/api/models", { signal: ctl.signal });
+      if (m.ok) models = (await m.json()).models || models;
+    } catch { /* health already proved online */ }
+    const c = await fetch("/api/gemini", {
       method: "POST", signal: ctl.signal,
-      headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: useModel, think: false, stream: false, keep_alive: -1,
-        options: { num_ctx: 8192, temperature: 0.7, num_predict: 200 },
-        messages: [{ role: "user", content:
-          `[PHASE: TALK] [Agent: Nova | Persona: Bold shock commander.]\n[3D Map State: {}]\nPlayer says: Connection test — reply with your two lines.` +
-          `\nReply with exactly two lines:\nLINE1: <your spoken reply>\nLINE2: DIRECTIVE: {"type":"hold","target":"none","location":"none"}` }],
+        model: useModel,
+        system: GEMINI_SYSTEMS.nova,
+        history: [],
+        prompt: `[PHASE: TALK] [Agent: Nova | Persona: Bold shock commander.]\n[3D Map State: {}]\nPlayer says: Connection test — reply with your two lines.\n${TALK_FORMAT}`,
+        temperature: 0.7, maxTokens: 200,
       }),
     });
-    if (!c.ok) throw new Error("/api/chat -> " + c.status);
-    const text = (await c.json()).message?.content || "";
-    const dl = text.split("\n").find((l) => !l.includes("DIRECTIVE")) || text;
-    return { models, useModel, decision: { directive: { type: "hold" }, dialogue: dl.replace(/^LINE1:\s*/, "").trim().slice(0, 180) } };
+    if (!c.ok) {
+      const err = await c.json().catch(() => ({}));
+      throw new Error("/api/gemini -> " + (err.error || c.status));
+    }
+    const text = (await c.json()).text || "";
+    const lines = String(text).split("\n");
+    let directive = { type: "hold" };
+    const spoken = [];
+    for (const ln of lines) {
+      const m2 = ln.match(/DIRECTIVE:\s*(\{.*\})/);
+      if (m2) { try { directive = JSON.parse(m2[1]); } catch { /* keep hold */ } }
+      else if (ln.trim()) spoken.push(ln.replace(/^LINE1:\s*/, "").trim());
+    }
+    return { models, useModel, decision: { directive, dialogue: spoken.join(" ").slice(0, 180) || text.slice(0, 180) } };
   } finally {
     clearTimeout(timeout);
   }

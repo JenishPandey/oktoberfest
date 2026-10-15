@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Alliance Arena — FPS + Cloud Gemma NPCs</title>
+<title>Alliance Arena — FPS + Gemini NPCs</title>
 <link rel="stylesheet" href="css/style.css" />
 <script type="importmap">
 { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
@@ -17,7 +17,8 @@
   <div id="phase" class="pill talk">TALK</div>
   <div id="timer">00:30</div>
   <div id="hp">HP 100</div>
-  <button id="settingsBtn" title="Tunnel URL / API key">⚙️ Settings</button>
+  <button id="settingsBtn" title="Gemini model">⚙️ Settings</button>
+  <button id="skipTalk" title="Skip talk phase">⏩ Skip</button>
 </div>
 <div id="status"></div>
 
@@ -36,39 +37,24 @@
     <button data-npc="rex">Rex</button>
     <button data-npc="vera">Vera</button>
   </div>
-  <div class="hint">WASD move · mouse look · Shift sprint · click = attack (battle) · NPCs think via cloud Gemma, move locally</div>
+  <div class="hint">WASD move · mouse look · Shift sprint · 1/2/3 attack mode · click = sword attack (battle) · ⏩ skips talk · NPCs pick melee/brute/ranged, move locally</div>
 </div>
 
-<!-- Entry overlay: asks for API code / tunnel URL, also reused as Settings -->
+<!-- Entry overlay, also reused as the API status page (⚙️). No inputs:
+     model + key are built in (server proxy), so the user only enters or tests. -->
 <div id="entry">
   <div class="card">
     <h1>⚔️ Alliance Arena</h1>
-    <p>1 human + 3 cloud-brained NPCs. Talk to forge alliances, then battle.</p>
-    <p>NPC strategy comes from a cloud-hosted <b>Gemma</b> model via your async tunnel URL.
-       The game sends snapshots; the model returns <code>{directive, dialogue}</code> JSON.
-       Movement &amp; pathfinding stay local, so lag never freezes NPCs.</p>
-    <label>Tunnel URL <small>(temporary link — update here whenever it changes)</small>
-      <input id="tunnelUrl" placeholder="https://xxxx.trycloudflare.com" />
-    </label>
-    <details class="adv">
-      <summary>Advanced: model + talk time</summary>
-      <label>Model
-        <input id="modelName" value="diplomacy-agent:latest" />
-      </label>
-      <label>Talk / strategize time (seconds)
-        <input id="talkSecs" type="number" min="10" max="600" value="30" />
-      </label>
-    </details>
+    <p>1 human + 3 Gemini-brained NPCs. Talk to forge alliances, then battle.</p>
+    <p>NPC strategy comes from Google <b>Gemini</b> built into this server —
+       no keys or links to paste. Movement &amp; pathfinding stay local,
+       so lag never freezes NPCs.</p>
     <div class="row">
       <button id="saveEntry">Enter Arena</button>
-      <button id="skipEntry" class="ghost">Play offline (fallback brains)</button>
-    </div>
-    <div class="row">
-      <button id="testConn" class="ghost">🔌 Test connection</button>
+      <button id="skipTalkEntry" class="ghost">⏩ Skip talk</button>
+      <button id="testConn" class="ghost">🔌 Test API key</button>
     </div>
     <div id="connStatus" class="conn"></div>
-    <small>Tunnel can expose <code>POST /decide</code> or OpenAI-style <code>POST /v1/chat/completions</code>.
-    Leave blank to play offline — you can add it later in ⚙️ Settings.</small>
   </div>
 </div>
 

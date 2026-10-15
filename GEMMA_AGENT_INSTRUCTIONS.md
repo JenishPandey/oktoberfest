@@ -166,8 +166,14 @@ ACTION resolution (double-parsed from `message.content`):
 {"agent":"Nova","action_type":"ALLY","target":"player",
  "target_coordinates":[10,10,10],
  "reasoning":"The player proposed a joint strike against Rex…",
- "battle_cry":"Side by side, we crush Rex's defenses!"}
+ "battle_cry":"Side by side, we crush Rex's defenses!",
+ "attack_mode":"melee"}
 ```
+
+`attack_mode` is required on `ATTACK`/`BETRAY` (ignored otherwise):
+`melee` (chase, 12 dmg) · `ranged` (hold 8–18 m, fire bolts, 8 dmg) ·
+`brute` (slow slam, 20 dmg). Nova favors melee/brute, Rex ranged/brute,
+Vera ranged.
 
 ## 7. Tunnel server spec (Kaggle + Ollama + Cloudflare)
 

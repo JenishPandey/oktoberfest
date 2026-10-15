@@ -15,6 +15,9 @@ export const ARENA_HALF = 26; // playable half-extent
 const worldAnim = [];
 
 export function buildWorld(scene) {
+  worldAnim.length = 0;
+  const anim = worldAnim; // per-frame world animations: fn(t, dt)
+  // NOTE: buildWorld runs once; tickWorld() below drives everything in `anim`.
   // --- renderer-agnostic lights / sky ---
   scene.background = new THREE.Color(0x87a5c9);
   scene.fog = new THREE.Fog(0x87a5c9, 55, 130);
@@ -80,9 +83,6 @@ export function buildWorld(scene) {
   scene.add(grid);
 
   const colliders = []; // {min:Vector3, max:Vector3} AABBs for collision + pathfinding
-  worldAnim.length = 0;
-  const anim = worldAnim; // per-frame world animations: fn(t, dt)
-  // NOTE: buildWorld runs once; tickWorld() below drives everything in `anim`.
 
   function addBox(x, z, w, h, d, color, name) {
     const m = new THREE.Mesh(
@@ -305,7 +305,7 @@ export function buildWorld(scene) {
     scene.add(b);
   }
   const fireflies = [];
-  const flyMat = new THREE.MeshBasicMaterial({ color: 0fef9a });
+  const flyMat = new THREE.MeshBasicMaterial({ color: 0xfef9a });
   for (let i = 0; i < 7; i++) {
     const f = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 6), flyMat);
     scene.add(f);

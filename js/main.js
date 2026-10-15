@@ -5,9 +5,12 @@ import { Player } from "./player.js";
 import { NPCAgent } from "./npcs.js";
 import { CloudBrain, testConnection } from "./llm.js";
 import { Game } from "./game.js";
-import { loadSettings, saveSettings } from "./config.js";
+import { loadSettings } from "./config.js";
 
 const settings = loadSettings();
+settings.provider = "gemini"; // fixed: built-in Gemini proxy, no user inputs
+settings.model = "gemini-3.5-flash-lite";
+settings.talkDurationSec = 30;
 
 const canvas = document.getElementById("scene");
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -59,44 +62,32 @@ const brain = new CloudBrain(() => settings, (id, line) => {
 });
 Object.values(npcs).forEach((n) => brain.start(n, game));
 
-// --- settings / entry overlay ---
-const overlay = $("entry"), tUrl = $("tunnelUrl"), model = $("modelName"), talkSecs = $("talkSecs");
-tUrl.value = settings.tunnelUrl || "";
-model.value = settings.model || "diplomacy-agent:latest";
-talkSecs.value = settings.talkDurationSec ?? 30;
+// --- entry overlay (no inputs) + API status page (⚙️ reopens it) ---
+const overlay = $("entry");
 $("saveEntry").onclick = () => {
-  settings.tunnelUrl = tUrl.value.trim();
-  settings.model = model.value.trim() || "diplomacy-agent:latest";
-  settings.talkDurationSec = Math.max(10, Math.min(600, +talkSecs.value || 30));
-  talkSecs.value = settings.talkDurationSec;
-  saveSettings(settings);
-  game.setTalkDuration(settings.talkDurationSec); // applies immediately if still in talk phase
   overlay.style.display = "none";
-  addFeed(settings.tunnelUrl
-    ? `🌐 Cloud Gemma linked: ${settings.tunnelUrl} (model ${settings.model})`
-    : "⚠️ No tunnel URL — NPCs run on local fallback brains until you add one in Settings.");
+  addFeed(`🌐 Gemini brains online (model ${settings.model}) — talk to forge alliances!`);
   canvas.requestPointerLock?.();
 };
-$("skipEntry").onclick = () => { $("saveEntry").onclick(); };
 $("settingsBtn").onclick = () => {
-  // refresh fields (link is temporary — always show what's currently stored)
-  tUrl.value = settings.tunnelUrl || "";
-  model.value = settings.model || "";
-  talkSecs.value = settings.talkDurationSec ?? 30;
   $("connStatus").textContent = "";
   $("connStatus").className = "conn";
   overlay.style.display = "flex";
 };
+const skipEntryBtn = $("skipTalkEntry");
+if (skipEntryBtn) skipEntryBtn.onclick = () => { overlay.style.display = "none"; canvas.requestPointerLock?.(); skipTalk(); };
+const skipBtn = $("skipTalk");
+if (skipBtn) skipBtn.onclick = () => skipTalk();
 $("testConn").onclick = async () => {
   const st = $("connStatus");
   st.className = "conn";
-  st.textContent = "⏳ Contacting tunnel…";
+  st.textContent = "⏳ Testing built-in API key…";
   try {
-    const r = await testConnection(tUrl.value.trim(), model.value.trim());
+    const r = await testConnection();
     st.className = "conn ok";
-    st.textContent = `✅ Models: ${r.models.join(", ")}\n✅ Test decision (${r.useModel}): ${r.decision.directive.type}` +
-      (r.decision.directive.target !== "none" ? ` ${r.decision.directive.target}` : "") +
-      (r.decision.directive.location !== "none" ? ` → ${r.decision.directive.location}` : "") +
+    st.textContent = `✅ API key works (model ${r.useModel})\n✅ Test decision: ${r.decision.directive.type}` +
+      (r.decision.directive.target && r.decision.directive.target !== "none" ? ` ${r.decision.directive.target}` : "") +
+      (r.decision.directive.location && r.decision.directive.location !== "none" ? ` → ${r.decision.directive.location}` : "") +
       `\n“${r.decision.dialogue}”`;
   } catch (e) {
     st.className = "conn err";
@@ -140,12 +131,68 @@ $("chatForm").onsubmit = (e) => {
   else addFeed("Battle phase — words are wind. Click to attack!");
 };
 
-// click = attack in battle
+// attack modes: 1 slash · 2 heavy · 3 bolt | click = attack in battle
+const MODE_NAMES = { slash: "Slash", heavy: "Heavy", bolt: "Bolt" };
+addEventListener("keydown", (e) => {
+  const m = { Digit1: "slash", Digit2: "heavy", Digit3: "bolt" }[e.code];
+  if (m && player.mode !== m) {
+    player.mode = m;
+    addFeed(`🗡️ Attack mode: ${MODE_NAMES[m]}`);
+  }
+});
 addEventListener("mousedown", () => {
   if (document.pointerLockElement !== canvas) return;
-  const msg = game.playerAttack();
+  player.swingSword(player.mode);
+  const msg = game.playerAttack(player.mode, player.getForward());
   if (msg) addFeed("🗡️ " + msg);
 });
+
+// talk skip: lock chat, resolve orders now, jump straight to battle
+async function skipTalk() {
+  if (game.phase !== "talk" || game.actionsRequested) return;
+  game.actionsRequested = true;
+  game.chatLocked = true;
+  addChat("System", "Talk skipped — commanders are issuing orders…");
+  addFeed("⏩ Talk phase skipped.");
+  try {
+    game.pendingActions = await brain.resolveActions(game);
+    addFeed(`📜 Orders received for ${Object.keys(game.pendingActions).length} commanders.`);
+  } catch {
+    game.pendingActions = {};
+  }
+  game.phaseEndsAt = performance.now() / 1000; // next tick fires "battle", applying orders
+}
+
+// beam flashes for every recorded hit (player + NPC bolts, cleaves, strikes)
+const beams = [];
+const BEAM_COLORS = { bolt: 0x38bdf8, heavy: 0xfb923c, slash: 0xfef08a, melee: 0xf87171, brute: 0xef4444, ranged: 0x38bdf8 };
+function spawnBeams() {
+  for (const s of game.shots.splice(0)) {
+    const a = game.agents[s.from], b = game.agents[s.to];
+    if (!a || !b) continue;
+    if (s.from !== "player" && typeof a.swing === "function") a.swing(s.mode); // NPC sword swing on hit
+    const from = new THREE.Vector3(a.pos.x, 1.2, a.pos.z);
+    const to = new THREE.Vector3(b.pos.x, 1.1, b.pos.z);
+    const len = from.distanceTo(to);
+    if (len < 0.1) continue;
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(0.09, 0.09, len),
+      new THREE.MeshBasicMaterial({ color: BEAM_COLORS[s.mode] || 0xffffff, transparent: true, opacity: 0.9 })
+    );
+    mesh.position.copy(from).add(to).multiplyScalar(0.5);
+    mesh.lookAt(to);
+    scene.add(mesh);
+    beams.push({ mesh, ttl: 0.14 });
+  }
+}
+function tickBeams(dt) {
+  for (let i = beams.length - 1; i >= 0; i--) {
+    const b = beams[i];
+    b.ttl -= dt;
+    b.mesh.material.opacity = Math.max(0, b.ttl / 0.14);
+    if (b.ttl <= 0) { scene.remove(b.mesh); b.mesh.geometry.dispose(); b.mesh.material.dispose(); beams.splice(i, 1); }
+  }
+}
 
 // --- HUD loop ---
 function fmt(s) {
@@ -156,7 +203,9 @@ function hud() {
   timerEl.textContent = fmt(game.timeLeft());
   phaseEl.textContent = game.phase.toUpperCase();
   phaseEl.className = "pill " + game.phase;
-  hpEl.textContent = `HP ${Math.max(0, Math.round(player.hp))}`;
+  hpEl.textContent = `HP ${Math.max(0, Math.round(player.hp))} · ${MODE_NAMES[player.mode]} [1/2/3]`;
+  const skipBtn = $("skipTalk");
+  if (skipBtn) skipBtn.style.display = game.phase === "talk" && !game.chatLocked ? "" : "none";
   const alive = Object.values(agents).filter((a) => a.alive).length;
   statusEl.textContent = game.phase === "over"
     ? `Game over — winner: ${game.winner}`
@@ -164,7 +213,7 @@ function hud() {
   // npc plates
   $("npcPlates").innerHTML = Object.values(npcs).map((n) =>
     `<div class="plate" style="border-color:#${n.color.toString(16).padStart(6, "0")}">
-      <b>${n.label}</b> HP ${Math.round(n.hp)} · <i>${n.directive.type}${n.directive.target && n.directive.target !== "none" ? " " + n.directive.target : ""}${n.directive.location && n.directive.location !== "none" ? " → " + n.directive.location : ""}</i>${n.thinking ? " · 💭" : ""}<br><span>“${n.lastDialogue}”</span>
+      <b>${n.label}</b> HP ${Math.round(n.hp)} · <i>${n.directive.type}${n.directive.type === "attack" ? ":" + (n.directive.mode || "melee") : ""}${n.directive.target && n.directive.target !== "none" ? " " + n.directive.target : ""}${n.directive.location && n.directive.location !== "none" ? " → " + n.directive.location : ""}</i>${n.thinking ? " · 💭" : ""}<br><span>“${n.lastDialogue}”</span>
     </div>`).join("");
 }
 
@@ -188,7 +237,7 @@ for (const [name, pos] of Object.entries(LANDMARKS)) {
 
 // --- main loop: local sim always runs at full fps; cloud only injects directives ---
 addFeed(`🎙️ TALK phase: ${settings.talkDurationSec}s to strategize. Walk up (WASD), type below, forge alliances.`);
-addChat("System", "Talk phase started. NPCs consult cloud Gemma every ~8s; movement stays local.");
+addChat("System", "Talk phase started. NPCs consult Google Gemini every ~8s; movement stays local.");
 let last = performance.now();
 let elapsed = 0;
 function loop(now) {
@@ -200,6 +249,8 @@ function loop(now) {
   player.update(dt);
   Object.values(npcs).forEach((n) => n.update(dt, agents));
   game.resolveCombat(dt);
+  spawnBeams();
+  tickBeams(dt);
   const ev = game.tick();
   if (ev === "lock") {
     // 0:03 remaining: fire all Phase-2 ACTION calls in parallel so orders

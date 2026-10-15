@@ -2,104 +2,52 @@
 // Runs BEFORE the 3D module. If js/main.js boots OK it overwrites these
 // handlers with the full versions. If the module dies (e.g. CDN blocked),
 // these keep Enter + Test working and the error box explains why.
+// No inputs: model + key are built into the server proxy.
 (function () {
-  var KEY = "alliance_arena_settings_v2";
-  var DEFAULTS = {
-    tunnelUrl: "https://requests-reality-geometry-middle.trycloudflare.com",
-    apiKey: "", model: "diplomacy-agent:latest",
-    pollIntervalSec: 8, talkDurationSec: 30,
-  };
   function $(id) { return document.getElementById(id); }
-  function load() {
-    try {
-      var raw = localStorage.getItem(KEY);
-      if (raw) return Object.assign({}, DEFAULTS, JSON.parse(raw));
-    } catch (e) {}
-    return Object.assign({}, DEFAULTS);
-  }
-  function save(s) { try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) {} }
-  function fields() {
-    return { tUrl: $("tunnelUrl"), model: $("modelName"), talkSecs: $("talkSecs") };
-  }
-  function prefill(s) {
-    var f = fields();
-    if (f.tUrl) f.tUrl.value = s.tunnelUrl || "";
-    if (f.model) f.model.value = s.model || "";
-    if (f.talkSecs) f.talkSecs.value = s.talkDurationSec != null ? s.talkDurationSec : 30;
-  }
-  function read(f) {
-    return {
-      tunnelUrl: (f.tUrl && f.tUrl.value || "").trim(),
-      model: (f.model && f.model.value || "").trim() || "diplomacy-agent:latest",
-      talkDurationSec: Math.max(10, Math.min(600, +(f.talkSecs && f.talkSecs.value) || 30)),
-    };
-  }
 
-  prefill(load());
-
-  var saveBtn = $("saveEntry"), skipBtn = $("skipEntry"),
-      setBtn = $("settingsBtn"), testBtn = $("testConn"),
-      overlay = $("entry"), st = $("connStatus");
+  var saveBtn = $("saveEntry"), setBtn = $("settingsBtn"),
+      testBtn = $("testConn"), overlay = $("entry"), st = $("connStatus"),
+      skipBtn = $("skipTalk"), skipEntryBtn = $("skipTalkEntry");
 
   function enter() {
-    var s = Object.assign(load(), read(fields()));
-    save(s);
-    prefill(s);
     if (overlay) overlay.style.display = "none";
     var c = document.getElementById("scene");
     if (c && c.requestPointerLock) { try { c.requestPointerLock(); } catch (e) {} }
   }
   if (saveBtn) saveBtn.onclick = enter;
-  if (skipBtn) skipBtn.onclick = enter;
+  if (skipEntryBtn) skipEntryBtn.onclick = enter; // battle starts via main.js skipTalk once booted
+  if (skipBtn) skipBtn.onclick = function () { /* wired by main.js after boot */ };
   if (setBtn) setBtn.onclick = function () {
-    prefill(load());
     if (st) { st.textContent = ""; st.className = "conn"; }
     if (overlay) overlay.style.display = "flex";
   };
   if (testBtn) testBtn.onclick = function () {
     if (!st) return;
     st.className = "conn";
-    st.textContent = "\u23F3 Contacting tunnel\u2026";
-    var base = ((fields().tUrl && fields().tUrl.value) || "").trim().replace(/\/$/, "");
-    var mdl = ((fields().model && fields().model.value) || "").trim();
-    if (!base) { st.className = "conn err"; st.textContent = "\u274C Enter a tunnel URL first."; return; }
+    st.textContent = "\u23F3 Testing built-in API key\u2026";
     var ctl = new AbortController();
-    var to = setTimeout(function () { ctl.abort(); }, 30000);
-    fetch(base + "/v1/models", { signal: ctl.signal })
+    var to = setTimeout(function () { ctl.abort(); }, 45000);
+    fetch("/api/gemini", {
+      method: "POST", signal: ctl.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gemini-3.5-flash-lite",
+        system: "You are Nova, a bold shock commander in a 3D arena game.",
+        history: [],
+        prompt: "Connection test. Reply with exactly two lines:\nLINE1: <your spoken reply>\nLINE2: DIRECTIVE: {\"type\":\"hold\",\"target\":\"none\",\"location\":\"none\"}",
+        temperature: 0.7, maxTokens: 200,
+      }),
+    })
       .then(function (r) {
-        if (!r.ok) throw new Error("/v1/models -> " + r.status);
+        if (!r.ok) throw new Error("/api/gemini -> " + r.status);
         return r.json();
       })
       .then(function (j) {
-        var models = (j.data || []).map(function (x) { return x.id; });
-        var useModel = mdl || models[0];
-        if (!useModel) throw new Error("Tunnel reachable but reports zero models.");
-        var snap = { npc_id: "nova", npc_label: "Nova", position: { x: -20, z: -20 },
-          hp: 100, phase: "talk", time_left_sec: 20,
-          landmarks: ["Fountain", "Ruins", "Tower", "Grove", "Docks"],
-          current_directive: { type: "hold" },
-          nearby: [{ id: "player", dist: 30, hp: 100 }],
-          alliances: {}, recent_chat: [], player_message: "Connection test." };
-        return fetch(base + "/v1/chat/completions", {
-          method: "POST", signal: ctl.signal,
-          headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
-          body: JSON.stringify({ model: useModel, temperature: 0.7,
-            response_format: { type: "json_object" },
-            messages: [
-              { role: "system", content: "Return ONLY valid JSON: {\"directive\":{\"type\":\"goto|hold|follow|attack|ally\",\"target\":\"player|nova|rex|vera|none\",\"location\":\"Fountain|Ruins|Tower|Grove|Docks|none\"},\"dialogue\":\"one short line\",\"ally\":\"none|player|nova|rex|vera\"}. TALK phase: never attack." },
-              { role: "user", content: JSON.stringify(snap) },
-            ] }),
-        }).then(function (r) {
-          if (!r.ok) throw new Error("/v1/chat/completions -> " + r.status);
-          return r.json();
-        }).then(function (c) {
-          var text = (c.choices && c.choices[0] && c.choices[0].message.content) || "{}";
-          var d = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
-          st.className = "conn ok";
-          st.textContent = "\u2705 Models: " + models.join(", ") +
-            "\n\u2705 Test decision (" + useModel + "): " + d.directive.type +
-            "\n\u201C" + d.dialogue + "\u201D";
-        });
+        if (j.error) throw new Error(j.error);
+        st.className = "conn ok";
+        st.textContent = "\u2705 API key works (gemini-3.5-flash-lite)\n\u201C" +
+          String(j.text || "").split("\n")[0].slice(0, 180) + "\u201D";
       })
       .catch(function (e) {
         st.className = "conn err";

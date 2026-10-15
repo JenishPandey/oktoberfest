@@ -15,6 +15,8 @@ export class Game {
     this.chatLocked = false;      // set at 0:03 — talk UI locks, ACTION fires
     this.actionsRequested = false;
     this.pendingActions = {};     // npcId -> resolved Phase-2 AgentAction
+    this.shots = [];              // per-frame hit events {from,to,mode} for beam FX (drained by main.js)
+    this._pCd = {};               // player attack cooldowns per mode (timestamps)
   }
 
   setTalkDuration(s) {
@@ -65,34 +67,86 @@ export class Game {
     }
   }
 
-  // melee resolution: NPC attack directives + player click attack
-  resolveCombat(dt) {
+  // Attack-mode stats. Player switches with 1/2/3; NPC mode comes from its
+  // attack directive (chosen by the LLM ACTION, default melee).
+  static PLAYER_MODES = {
+    slash: { dmg: 18, range: 3.2, cd: 0.5, label: "Slash" },
+    heavy: { dmg: 30, range: 3.8, cd: 1.6, label: "Heavy" },
+    bolt:  { dmg: 12, range: 25, cd: 0.8, label: "Bolt" },
+  };
+  static NPC_MODES = {
+    melee:  { dmg: 12, range: 2.0, cd: 0.9 },
+    brute:  { dmg: 20, range: 2.2, cd: 1.6 },
+    ranged: { dmg: 8, range: 18, minRange: 8, cd: 2.0 },
+  };
+
+  now() { return performance.now() / 1000; }
+
+  // NPC attack directives, resolved per attack mode. Ranged NPCs hold a
+  // distance band (locomotion in npcs.js) and fire bolts from afar.
+  // Every hit is recorded in this.shots for the renderer (beam flashes).
+  resolveCombat() {
     if (this.phase !== "battle") return;
     for (const [id, a] of Object.entries(this.agents)) {
       if (!a.alive || !a.directive) continue; // player has no directive
       if (a.directive.type !== "attack" || !a.directive.target) continue;
       const t = this.agents[a.directive.target];
       if (!t?.alive) continue;
-      if (a.pos.distanceTo(t.pos) < 2.0) {
-        a._dmgTick = (a._dmgTick || 0) + dt;
-        if (a._dmgTick > 0.9) {
-          a._dmgTick = 0;
-          this.damage(a.directive.target, 12, id);
-        }
-      }
+      const st = Game.NPC_MODES[a.directive.mode] || Game.NPC_MODES.melee;
+      const dist = a.pos.distanceTo(t.pos);
+      if (dist > st.range) continue;
+      if (st.minRange && dist < st.minRange * 0.5) continue; // too close to shoot
+      if ((a._atkCd || 0) > this.now()) continue;
+      a._atkCd = this.now() + st.cd;
+      this.damage(a.directive.target, st.dmg, id);
+      this.shots.push({ from: id, to: a.directive.target, mode: a.directive.mode || "melee" });
     }
   }
 
-  playerAttack() {
+  playerAttack(mode = "slash", dir = null) {
     if (this.phase !== "battle") return "Talk phase — no combat yet.";
-    let best = null, bd = 3.2;
-    for (const [id, a] of Object.entries(this.agents)) {
-      if (id === "player" || !a.alive) continue;
-      const d = this.agents.player.pos.distanceTo(a.pos);
+    const st = Game.PLAYER_MODES[mode] || Game.PLAYER_MODES.slash;
+    const me = this.agents.player;
+    if ((this._pCd?.[mode] || 0) > this.now()) return `${st.label} recharging…`;
+    const aliveNpcs = Object.entries(this.agents).filter(([id, a]) => id !== "player" && a.alive);
+    if (mode === "bolt") {
+      // hitscan: nearest NPC roughly in the crosshair direction
+      if (!dir) return "No target in sights.";
+      let best = null, bd = st.range;
+      for (const [id, a] of aliveNpcs) {
+        const dx = a.pos.x - me.pos.x, dz = a.pos.z - me.pos.z;
+        const d = Math.hypot(dx, dz);
+        if (d > st.range || d < 0.5) continue;
+        const dot = (dx * dir.x + dz * dir.z) / (d * Math.hypot(dir.x, dir.z));
+        if (dot > 0.978 && d < bd) { bd = d; best = id; }
+      }
+      if (!best) return "No target in sights.";
+      this._pCd = { ...this._pCd, [mode]: this.now() + st.cd };
+      this.damage(best, st.dmg, "player");
+      this.shots.push({ from: "player", to: best, mode: "bolt" });
+      return `You bolt ${this.agents[best].label}!`;
+    }
+    if (mode === "heavy") {
+      // cleave: every NPC in range
+      const hit = aliveNpcs.filter(([, a]) => me.pos.distanceTo(a.pos) < st.range);
+      if (!hit.length) return "No one in range.";
+      this._pCd = { ...this._pCd, [mode]: this.now() + st.cd };
+      for (const [id] of hit) {
+        this.damage(id, st.dmg, "player");
+        this.shots.push({ from: "player", to: id, mode: "heavy" });
+      }
+      return `You cleave ${hit.map(([id]) => this.agents[id].label).join(", ")}!`;
+    }
+    // slash: nearest NPC in range
+    let best = null, bd = st.range;
+    for (const [id, a] of aliveNpcs) {
+      const d = me.pos.distanceTo(a.pos);
       if (d < bd) { bd = d; best = id; }
     }
     if (!best) return "No one in range.";
-    this.damage(best, 18, "player");
+    this._pCd = { ...this._pCd, [mode]: this.now() + st.cd };
+    this.damage(best, st.dmg, "player");
+    this.shots.push({ from: "player", to: best, mode: "slash" });
     return `You strike ${this.agents[best].label}!`;
   }
 
